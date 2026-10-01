@@ -21,7 +21,13 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from dotenv import load_dotenv
-from openai import OpenAI, OpenAIError
+from openai import (
+    APIConnectionError,
+    APITimeoutError,
+    OpenAI,
+    OpenAIError,
+    RateLimitError,
+)
 
 load_dotenv(Path(__file__).resolve().with_name(".env"))
 
@@ -243,27 +249,73 @@ class TextGenerator(Protocol):
 
 
 class OpenAIGenerator:
-    def __init__(self, max_output_tokens: int = 300) -> None:
+    MIN_INTERVAL = 15.0  # giây giữa 2 request, ~4 request/phút
+    MAX_RETRIES = 6
+
+    def __init__(self, max_output_tokens: int = 1024) -> None:
         api_key = os.getenv("OPENAI_API_KEY", "").strip()
         self.model = os.getenv("OPENAI_MODEL", "").strip()
+        base_url = os.getenv("OPENAI_BASE_URL", "").strip() or None
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY is missing from .env")
         if not self.model:
             raise RuntimeError("OPENAI_MODEL is missing from .env")
-        self.client = OpenAI(api_key=api_key)
+        self.client = OpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=60.0,
+            max_retries=0,  # SDK mặc định tự retry 2 lần, làm tốn quota
+        )
         self.max_output_tokens = max_output_tokens
+        self._last_call = 0.0
 
     def generate(self, prompt: str) -> str:
-        response = self.client.responses.create(
-            model=self.model,
-            input=prompt,
-            temperature=0,
-            max_output_tokens=self.max_output_tokens,
-        )
-        answer = response.output_text.strip()
-        if not answer:
-            raise RuntimeError("OpenAI returned an empty answer")
-        return answer
+        for attempt in range(1, self.MAX_RETRIES + 1):
+            wait = self.MIN_INTERVAL - (time.monotonic() - self._last_call)
+            if wait > 0:
+                time.sleep(wait)
+            self._last_call = time.monotonic()
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0,
+                    max_tokens=self.max_output_tokens,
+                )
+            except RateLimitError as exc:
+                if attempt == self.MAX_RETRIES:
+                    raise
+                text = str(exc)
+                if "PerDay" in text:
+                    raise RuntimeError(
+                        "Het quota theo NGAY (PerDay); retry khong giup duoc."
+                    ) from exc
+                match = re.search(r"retry in ([\d.]+)s", text)
+                delay = float(match.group(1)) + 2 if match else 60.0
+                print(
+                    f"  429 rate limit, retry {attempt} after {delay:.0f}s "
+                    f"| {text[:200]}",
+                    flush=True,
+                )
+                time.sleep(delay)
+                self._last_call = time.monotonic()
+                continue
+            except (APIConnectionError, APITimeoutError) as exc:
+                if attempt == self.MAX_RETRIES:
+                    raise
+                delay = min(5 * attempt, 30)
+                print(
+                    f"  connection error ({exc.__class__.__name__}), "
+                    f"retry {attempt} after {delay}s",
+                    flush=True,
+                )
+                time.sleep(delay)
+                continue
+            answer = (response.choices[0].message.content or "").strip()
+            if not answer:
+                raise RuntimeError("Model returned an empty answer")
+            return answer
+        raise RuntimeError("Unreachable")
 
 
 @dataclass(frozen=True)
